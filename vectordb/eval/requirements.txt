@@ -1,0 +1,6 @@
+absl-py
+chromadb
+datasets
+gcsfs
+lancedb
+redis
