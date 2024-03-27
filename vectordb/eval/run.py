@@ -1,28 +1,29 @@
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from datasets import load_dataset
-import json
+from sentence_transformers.util import semantic_search
 from typing import List
 import numpy as np
 
-import chromadb
-import lancedb
-import redis
-
-from redis.commands.search.field import TextField, VectorField
-from redis.commands.search.indexDefinition import IndexDefinition, IndexType
-from redis.commands.search.query import Query
+import csv
+import logging
+import os
+import time
+import torch
+import shutil
 
 from absl import app
 from absl import flags
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string('embeddings_csv', '', 'Embeddings CSV file')
-flags.DEFINE_string('system', 'redis', 'redis | chroma | lance')
+flags.DEFINE_string('store_embeddings', '', 'Store Embeddings CSV file')
+flags.DEFINE_string('test_embeddings', '', 'Test Embeddings CSV file')
+flags.DEFINE_string('system', 'all', 'baseline | redis | chroma | lance | all')
 
 _INDEX = 'idx-vars'
 _DIM = 384
-_LIMIT = 1000
+_LIMIT = 100000
+_TOPK = 40
 
 
 @dataclass
@@ -32,7 +33,34 @@ class Data:
     embeddings: List[List[float]]
 
 
-def get_data(embeddings_file: str) -> Data:
+@dataclass
+class Stats:
+    system: str = ''
+    connection_time_sec: float = -1
+    index_creation_time_sec: float = -1
+    total_rows: int = 0
+    loading_time_sec: float = -1
+    num_queries: int = 0
+    num_results: int = 0
+    search_time_sec: float = -1
+
+
+#
+# Helpers
+#
+
+
+def write_stats(stats: List[Stats]):
+    with open('stats.csv', 'w') as fp:
+        cols = [f.name for f in fields(Stats())]
+        csvw = csv.DictWriter(fp, fieldnames=cols)
+        csvw.writeheader()
+        csvw.writerows([asdict(it) for it in stats])
+
+
+def load_embeddings(name: str,
+                    embeddings_file: str,
+                    lim: int = _LIMIT) -> Data:
     ds = load_dataset('csv', data_files=embeddings_file)
     df = ds['train'].to_pandas()
     dcids = df['dcid'].values.tolist()
@@ -40,15 +68,56 @@ def get_data(embeddings_file: str) -> Data:
     sentences = df['sentence'].values.tolist()
     df = df.drop('sentence', axis=1)
     embeddings = df.to_numpy().tolist()
-    return Data(dcids[:_LIMIT], sentences[:_LIMIT], embeddings[:_LIMIT])
+    logging.info(f'Loaded {len(dcids)} "{name}" embeddings!')
+    return Data(dcids[:lim], sentences[:lim], embeddings[:lim])
+
+
+class Timeit:
+
+    def __init__(self):
+        self.start = time.time()
+
+    def reset(self):
+        ret = time.time() - self.start
+        self.start = ret + self.start
+        return ret
+
+
+#
+# Sentence Transformer
+#
+def run_baseline(data: Data, test: Data) -> Stats:
+    stats = Stats(system='Baseline (SentenceTransformer)')
+
+    store = torch.tensor(data.embeddings, dtype=torch.float)
+    query = torch.tensor(test.embeddings, dtype=torch.float)
+
+    t = Timeit()
+    hits = semantic_search(query, store, top_k=_TOPK)
+    stats.num_results = 0
+    for hit in hits:
+        stats.num_results += len(hit)
+    stats.search_time_sec = t.reset()
+    logging.info(f'Baseline returned {stats.num_results} results')
+
+    return stats
+
+
+#
+#  REDIS Stuff
+#
+import redis
+from redis.commands.search.field import TextField, VectorField
+from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+from redis.commands.search.query import Query
 
 
 def _create_redis_index(client):
     try:
         # check to see if index exists
         client.ft(_INDEX).info()
-        print('Index already exists!')
         client.ft(_INDEX).dropindex(delete_documents=True)
+        logging.info('Index already exists, deleting!')
     except:
         pass
 
@@ -65,108 +134,180 @@ def _create_redis_index(client):
                     as_name='vector'),
     )
 
-    # index Definition
-    definition = IndexDefinition(prefix=['vars:'], index_type=IndexType.JSON)
-
     # create Index
-    client.ft('idx:vars').create_index(fields=schema, definition=definition)
-
-    # Check the index
-    info = client.ft(_INDEX).info()
-    print(info)
-    num_docs = info['num_docs']
-    indexing_failures = info['hash_indexing_failures']
-    total_indexing_time = info['total_indexing_time']
-    percent_indexed = float(info['percent_indexed']) * 100
-    print(
-        f"{num_docs} documents ({percent_indexed} percent) indexed with {indexing_failures} failures in {float(total_indexing_time):.2f} milliseconds"
-    )
+    client.ft(_INDEX).create_index(
+        fields=schema, definition=IndexDefinition(index_type=IndexType.JSON))
 
 
-def _search_redis_index(client, query_embeddings):
-    query = (Query('(*)=>[KNN 3 @vector $query_vector AS vector_score]').
-             sort_by('vector_score').return_fields('vector_score', 'dcid',
-                                                   'sentence').dialect(2))
-    result_docs = client.ft(_INDEX).search(query, {
-        'query_vector':
-        np.array(query_embeddings, dtype=np.float32).tobytes()
-    } | {}).docs
-    for doc in result_docs:
-        vector_score = round(1 - float(doc.vector_score), 2)
-        print({
-            'query': query,
-            'score': vector_score,
-            'id': doc.dcid,
-            'brand': doc.sentence,
-        })
+def _search_redis_index(client, test: Data):
+    query = (Query(f'(*)=>[KNN {_TOPK} @vector $query_vector AS vector_score]'
+                   ).sort_by('vector_score').return_fields(
+                       'vector_score', 'dcid', 'sentence').dialect(2))
+    tot_results = 0
+    for emb in test.embeddings:
+        result_docs = client.ft(_INDEX).search(
+            query, {
+                'query_vector': np.array(emb, dtype=np.float32).tobytes()
+            } | {}).docs
+        tot_results += len(result_docs)
+    logging.info(f'Redis returned {tot_results} results')
+
+    return tot_results
 
 
-def run_redis(data: Data):
-    client = redis.Redis(host='localhost', port=6379, decode_responses=True)
-    client.ping()
-
+def _load_redis_index(client, data: Data):
     pipeline = client.pipeline()
     keys = []
     for i, s, e in zip(data.dcids, data.sentences, data.embeddings):
-        redis_key = f'v:{i:s}'
+        redis_key = f'{i}:{s}'
         pipeline.json().set(redis_key, '$', {
             'dcid': i,
             'sentence': s,
             'embeddings': e
         })
         keys.append(redis_key)
+    result = pipeline.execute()
+    logging.info(f'Loaded {sum(result)} docs successfully!')
+    # logging.info(json.dumps(client.json().get(keys[0]), indent=2))
 
-    pipeline.execute()
-    print(json.dumps(client.json().get(keys[0]), indent=2))
+    # Check the index
+    info = client.ft(_INDEX).info()
+    num_docs = info['num_docs']
+    indexing_failures = info['hash_indexing_failures']
+    total_indexing_time = info['total_indexing_time']
+    percent_indexed = float(info['percent_indexed']) * 100
+    logging.info(
+        f"{num_docs} documents ({percent_indexed} percent) indexed with {indexing_failures} failures in {float(total_indexing_time):.2f} milliseconds"
+    )
+
+
+def run_redis(data: Data, test: Data) -> Stats:
+    stats = Stats(system='Redis-VSS')
+
+    t = Timeit()
+    client = redis.Redis(host='localhost', port=6379, decode_responses=True)
+    client.ping()
+    stats.connection_time_sec = t.reset()
 
     _create_redis_index(client)
-    _search_redis_index(client, data.embeddings[0])
+    stats.index_creation_time_sec = t.reset()
+
+    _load_redis_index(client, data)
+    stats.loading_time_sec = t.reset()
+
+    stats.num_results = _search_redis_index(client, test)
+    stats.search_time_sec = t.reset()
+    return stats
 
 
-def run_chroma(data: Data):
-    client = chromadb.Client()
+#
+# Chroma Stuff
+#
+import chromadb
+
+
+def run_chroma(data: Data, test: Data) -> Stats:
+    stats = Stats(system='Chroma')
+    if os.path.exists('/tmp/.chroma'):
+        shutil.rmtree('/tmp/.chroma')
+
+    t = Timeit()
+    client = chromadb.PersistentClient('/tmp/.chroma')
+    stats.connection_time_sec = t.reset()
+
     collection = client.create_collection(name=_INDEX,
                                           metadata={"hnsw:space": "cosine"})
-    collection.add(
-        embeddings=data.embeddings,
-        documents=data.dcids,
-        ids=[f'{i}:{s}' for i, s in zip(data.dcids, data.sentences)])
-    print('Indexed docs into Chroma')
+    stats.index_creation_time_sec = t.reset()
 
-    result = collection.query(
-        query_embeddings=data.embeddings[0],
-        n_results=10,
-    )
-    print(result)
+    nadded = 0
+    while nadded < len(data.dcids):
+        s, e = nadded, nadded + 5000
+        collection.add(
+            embeddings=data.embeddings[s:e],
+            documents=data.dcids[s:e],
+            ids=[
+                f'{i}:{s}'
+                for i, s in zip(data.dcids[s:e], data.sentences[s:e])
+            ])
+        nadded += len(data.dcids[s:e])
 
-    return
+    stats.loading_time_sec = t.reset()
+    logging.info(f'Indexed {len(data.dcids)} docs into Chroma')
+
+    stats.num_results = 0
+    for emb in test.embeddings:
+        results = collection.query(
+            query_embeddings=emb,
+            n_results=_TOPK,
+        )
+        stats.num_results += len(results)
+    stats.search_time_sec = t.reset()
+    logging.info(f'Chroma returned {stats.num_results} results')
+
+    return stats
 
 
-def _search_lance(db, embeddings: List[float]):
+#
+# Lance Stuff
+#
+
+import lancedb
+
+
+def _search_lance(db, test: Data):
     tbl = db.open_table(_INDEX)
-    result = tbl.search(embeddings).limit(10).to_list()
-    print(result)
+    tot_results = 0
+    for emb in test.embeddings:
+        results = tbl.search(emb).limit(_TOPK).to_list()
+        tot_results += len(results)
+    logging.info(f'Lance returned {tot_results}')
+    return tot_results
 
 
-def run_lance(data: Data):
-    db = lancedb.connect("~/.lancedb")
+def run_lance(data: Data, test: Data) -> Stats:
+    stats = Stats(system='LanceDB')
+    if os.path.exists('/tmp/.lancedb'):
+        shutil.rmtree('/tmp/.lancedb')
+
+    t = Timeit()
+    db = lancedb.connect("/tmp/.lancedb")
+    stats.connection_time_sec = t.reset()
 
     records = []
     for d, s, e in zip(data.dcids, data.sentences, data.embeddings):
         records.append({'vector': e, 'dcid': d, 'sentence': s})
     db.create_table(_INDEX, records)
-    _search_lance(db, data.embeddings[0])
-    return
+    stats.loading_time_sec = t.reset()
+    logging.info(f'Indexed {len(data.dcids)} docs into LanceDB')
+
+    stats.num_results = _search_lance(db, test)
+    stats.search_time_sec = t.reset()
+
+    return stats
+
+
+#
+# Main
+#
 
 
 def main(_):
-    data = get_data(FLAGS.embeddings_csv)
-    if FLAGS.system == 'redis':
-        run_redis(data)
-    elif FLAGS.system == 'chroma':
-        run_chroma(data)
-    elif FLAGS.system == 'lance':
-        run_lance(data)
+    _ROUTER = {
+        'baseline': [run_baseline],
+        'redis': [run_redis],
+        'chroma': [run_chroma],
+        'lance': [run_lance],
+        'all': [run_baseline, run_redis, run_chroma, run_lance],
+    }
+    stats = []
+    data = load_embeddings('store', FLAGS.store_embeddings)
+    test = load_embeddings('test', FLAGS.test_embeddings)
+    for fn in _ROUTER[FLAGS.system]:
+        s = fn(data, test)
+        s.total_rows = len(data.embeddings)
+        s.num_queries = len(test.embeddings)
+        stats.append(s)
+    write_stats(stats)
 
 
 if __name__ == "__main__":

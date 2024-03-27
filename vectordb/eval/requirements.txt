@@ -4,3 +4,5 @@ datasets
 gcsfs
 lancedb
 redis
+sentence_transformers
+torch
