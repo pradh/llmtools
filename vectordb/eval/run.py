@@ -274,7 +274,7 @@ async def _search_async_lance(db, test: Data) -> int:
     tot_results = 0
     tot_latency = 0.0
     while ndone < len(test.embeddings):
-        s, e = ndone, ndone + _BATCH_SZ
+        s, e = ndone, ndone + 10
         sl = test.embeddings[s:e]
         results = []
         for emb in sl:
