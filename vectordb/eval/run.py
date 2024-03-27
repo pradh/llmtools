@@ -4,6 +4,7 @@ from sentence_transformers.util import semantic_search
 from typing import List
 import numpy as np
 
+import asyncio
 import csv
 import logging
 import os
@@ -86,10 +87,10 @@ class Timeit:
 #
 # Sentence Transformer
 #
-def run_baseline(data: Data, test: Data) -> Stats:
+def run_baseline(store: Data, test: Data) -> Stats:
     stats = Stats(system='Baseline (SentenceTransformer)')
 
-    store = torch.tensor(data.embeddings, dtype=torch.float)
+    store = torch.tensor(store.embeddings, dtype=torch.float)
     query = torch.tensor(test.embeddings, dtype=torch.float)
 
     t = Timeit()
@@ -140,9 +141,9 @@ def _create_redis_index(client):
 
 
 def _search_redis_index(client, test: Data):
-    query = (Query(f'(*)=>[KNN {_TOPK} @vector $query_vector AS vector_score]'
-                   ).sort_by('vector_score').return_fields(
-                       'vector_score', 'dcid', 'sentence').dialect(2))
+    query = (Query('(*)=>[KNN 40 @vector $query_vector AS vector_score]').
+             sort_by('vector_score').return_fields('vector_score', 'dcid',
+                                                   'sentence').dialect(2))
     tot_results = 0
     for emb in test.embeddings:
         result_docs = client.ft(_INDEX).search(
@@ -181,7 +182,7 @@ def _load_redis_index(client, data: Data):
     )
 
 
-def run_redis(data: Data, test: Data) -> Stats:
+def run_redis(store: Data, test: Data) -> Stats:
     stats = Stats(system='Redis-VSS')
 
     t = Timeit()
@@ -192,7 +193,7 @@ def run_redis(data: Data, test: Data) -> Stats:
     _create_redis_index(client)
     stats.index_creation_time_sec = t.reset()
 
-    _load_redis_index(client, data)
+    _load_redis_index(client, store)
     stats.loading_time_sec = t.reset()
 
     stats.num_results = _search_redis_index(client, test)
@@ -206,7 +207,7 @@ def run_redis(data: Data, test: Data) -> Stats:
 import chromadb
 
 
-def run_chroma(data: Data, test: Data) -> Stats:
+def run_chroma(store: Data, test: Data) -> Stats:
     stats = Stats(system='Chroma')
     if os.path.exists('/tmp/.chroma'):
         shutil.rmtree('/tmp/.chroma')
@@ -220,19 +221,19 @@ def run_chroma(data: Data, test: Data) -> Stats:
     stats.index_creation_time_sec = t.reset()
 
     nadded = 0
-    while nadded < len(data.dcids):
+    while nadded < len(store.dcids):
         s, e = nadded, nadded + 5000
         collection.add(
-            embeddings=data.embeddings[s:e],
-            documents=data.dcids[s:e],
+            embeddings=store.embeddings[s:e],
+            documents=store.dcids[s:e],
             ids=[
                 f'{i}:{s}'
-                for i, s in zip(data.dcids[s:e], data.sentences[s:e])
+                for i, s in zip(store.dcids[s:e], store.sentences[s:e])
             ])
-        nadded += len(data.dcids[s:e])
+        nadded += len(store.dcids[s:e])
 
     stats.loading_time_sec = t.reset()
-    logging.info(f'Indexed {len(data.dcids)} docs into Chroma')
+    logging.info(f'Indexed {len(store.dcids)} docs into Chroma')
 
     stats.num_results = 0
     for emb in test.embeddings:
@@ -254,36 +255,55 @@ def run_chroma(data: Data, test: Data) -> Stats:
 import lancedb
 
 
-def _search_lance(db, test: Data):
-    tbl = db.open_table(_INDEX)
+async def _search_lance_async(tbl, emb) -> int:
+    df = await tbl.vector_search(emb).distance_type('cosine').limit(
+        _TOPK).to_pandas()
+    return len(df.values.tolist())
+
+
+async def _search_lance(db, test: Data) -> int:
+    tbl = await db.open_table(_INDEX)
+
+    ndone = 0
     tot_results = 0
-    for emb in test.embeddings:
-        results = tbl.search(emb).limit(_TOPK).to_list()
-        tot_results += len(results)
+    while ndone < len(test.embeddings):
+        s, e = ndone, ndone + 50
+        sl = test.embeddings[s:e]
+        results = []
+        for emb in sl:
+            results.append(_search_lance_async(tbl, emb))
+        results = await asyncio.gather(*results)
+        tot_results += sum(results)
+        ndone += len(sl)
+
     logging.info(f'Lance returned {tot_results}')
     return tot_results
 
 
-def run_lance(data: Data, test: Data) -> Stats:
+async def _run_lance(store: Data, test: Data) -> Stats:
     stats = Stats(system='LanceDB')
     if os.path.exists('/tmp/.lancedb'):
         shutil.rmtree('/tmp/.lancedb')
 
     t = Timeit()
-    db = lancedb.connect("/tmp/.lancedb")
+    db = await lancedb.connect_async("/tmp/.lancedb")
     stats.connection_time_sec = t.reset()
 
     records = []
-    for d, s, e in zip(data.dcids, data.sentences, data.embeddings):
+    for d, s, e in zip(store.dcids, store.sentences, store.embeddings):
         records.append({'vector': e, 'dcid': d, 'sentence': s})
-    db.create_table(_INDEX, records)
+    await db.create_table(_INDEX, records)
     stats.loading_time_sec = t.reset()
-    logging.info(f'Indexed {len(data.dcids)} docs into LanceDB')
+    logging.info(f'Indexed {len(store.dcids)} docs into LanceDB')
 
-    stats.num_results = _search_lance(db, test)
+    stats.num_results = await _search_lance(db, test)
     stats.search_time_sec = t.reset()
 
     return stats
+
+
+def run_lance(store: Data, test: Data) -> Stats:
+    return asyncio.run(_run_lance(store, test))
 
 
 #
