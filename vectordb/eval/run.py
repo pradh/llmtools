@@ -25,6 +25,7 @@ _INDEX = 'idx-vars'
 _DIM = 384
 _LIMIT = 100000
 _TOPK = 40
+_BATCH_SZ = 50
 
 
 @dataclass
@@ -42,8 +43,9 @@ class Stats:
     total_rows: int = 0
     loading_time_sec: float = -1
     num_queries: int = 0
-    num_results: int = 0
+    num_matches: int = 0
     search_time_sec: float = -1
+    search_api_latency_sec: float = -1
 
 
 #
@@ -95,11 +97,12 @@ def run_baseline(store: Data, test: Data) -> Stats:
 
     t = Timeit()
     hits = semantic_search(query, store, top_k=_TOPK)
-    stats.num_results = 0
+    stats.num_matches = 0
     for hit in hits:
-        stats.num_results += len(hit)
+        stats.num_matches += len(hit)
     stats.search_time_sec = t.reset()
-    logging.info(f'Baseline returned {stats.num_results} results')
+    stats.search_api_latency_sec = stats.search_time_sec / len(test.embeddings)
+    logging.info(f'Baseline returned {stats.num_matches} results')
 
     return stats
 
@@ -118,7 +121,7 @@ def _create_redis_index(client):
         # check to see if index exists
         client.ft(_INDEX).info()
         client.ft(_INDEX).dropindex(delete_documents=True)
-        logging.info('Index already exists, deleting!')
+        logging.info('Redis index already exists, deleting!')
     except:
         pass
 
@@ -168,7 +171,7 @@ def _load_redis_index(client, data: Data):
         })
         keys.append(redis_key)
     result = pipeline.execute()
-    logging.info(f'Loaded {sum(result)} docs successfully!')
+    logging.info(f'Loaded {sum(result)} docs into Redis successfully!')
     # logging.info(json.dumps(client.json().get(keys[0]), indent=2))
 
     # Check the index
@@ -196,8 +199,9 @@ def run_redis(store: Data, test: Data) -> Stats:
     _load_redis_index(client, store)
     stats.loading_time_sec = t.reset()
 
-    stats.num_results = _search_redis_index(client, test)
+    stats.num_matches = _search_redis_index(client, test)
     stats.search_time_sec = t.reset()
+    stats.search_api_latency_sec = stats.search_time_sec / len(test.embeddings)
     return stats
 
 
@@ -235,15 +239,16 @@ def run_chroma(store: Data, test: Data) -> Stats:
     stats.loading_time_sec = t.reset()
     logging.info(f'Indexed {len(store.dcids)} docs into Chroma')
 
-    stats.num_results = 0
+    stats.num_matches = 0
     for emb in test.embeddings:
         results = collection.query(
             query_embeddings=emb,
             n_results=_TOPK,
         )
-        stats.num_results += len(results)
+        stats.num_matches += len(results)
     stats.search_time_sec = t.reset()
-    logging.info(f'Chroma returned {stats.num_results} results')
+    stats.search_api_latency_sec = stats.search_time_sec / len(test.embeddings)
+    logging.info(f'Chroma returned {stats.num_matches} results')
 
     return stats
 
@@ -255,33 +260,37 @@ def run_chroma(store: Data, test: Data) -> Stats:
 import lancedb
 
 
-async def _search_lance_async(tbl, emb) -> int:
+async def _search_lance_async_int(tbl, emb) -> int:
+    t = Timeit()
     df = await tbl.vector_search(emb).distance_type('cosine').limit(
         _TOPK).to_pandas()
-    return len(df.values.tolist())
+    return len(df.values.tolist()), t.reset()
 
 
-async def _search_lance(db, test: Data) -> int:
+async def _search_async_lance(db, test: Data) -> int:
     tbl = await db.open_table(_INDEX)
 
     ndone = 0
     tot_results = 0
+    tot_latency = 0.0
     while ndone < len(test.embeddings):
-        s, e = ndone, ndone + 50
+        s, e = ndone, ndone + _BATCH_SZ
         sl = test.embeddings[s:e]
         results = []
         for emb in sl:
-            results.append(_search_lance_async(tbl, emb))
+            results.append(_search_lance_async_int(tbl, emb))
         results = await asyncio.gather(*results)
-        tot_results += sum(results)
+        tot_results += sum([r[0] for r in results])
+        tot_latency += sum([r[1] for r in results])
         ndone += len(sl)
 
     logging.info(f'Lance returned {tot_results}')
-    return tot_results
+    return tot_results, tot_latency / ndone
 
 
-async def _run_lance(store: Data, test: Data) -> Stats:
-    stats = Stats(system='LanceDB')
+async def _run_async_lance(store: Data, test: Data) -> Stats:
+    stats = Stats(system='LanceDB Async')
+
     if os.path.exists('/tmp/.lancedb'):
         shutil.rmtree('/tmp/.lancedb')
 
@@ -296,14 +305,116 @@ async def _run_lance(store: Data, test: Data) -> Stats:
     stats.loading_time_sec = t.reset()
     logging.info(f'Indexed {len(store.dcids)} docs into LanceDB')
 
-    stats.num_results = await _search_lance(db, test)
+    stats.num_matches, stats.search_api_latency_sec = await _search_async_lance(
+        db, test)
     stats.search_time_sec = t.reset()
 
     return stats
 
 
-def run_lance(store: Data, test: Data) -> Stats:
-    return asyncio.run(_run_lance(store, test))
+def run_async_lance(store: Data, test: Data) -> Stats:
+    return asyncio.run(_run_async_lance(store, test))
+
+
+def _search_sync_lance(db, test: Data) -> int:
+    tbl = db.open_table(_INDEX)
+
+    tot_results = 0
+    for i, emb in enumerate(test.embeddings):
+        li = tbl.search(emb).metric('cosine').limit(_TOPK).to_list()
+        tot_results += len(li)
+        if i % 1000 == 999:
+            logging.info(f'... {i} queried')
+
+    logging.info(f'Lance returned {tot_results}')
+    return tot_results
+
+
+def run_sync_lance(store: Data, test: Data) -> Stats:
+    stats = Stats(system='LanceDB Sync')
+
+    if os.path.exists('/tmp/.lancedb'):
+        shutil.rmtree('/tmp/.lancedb')
+
+    t = Timeit()
+    db = lancedb.connect("/tmp/.lancedb")
+    stats.connection_time_sec = t.reset()
+
+    records = []
+    for d, s, e in zip(store.dcids, store.sentences, store.embeddings):
+        records.append({'vector': e, 'dcid': d, 'sentence': s})
+    db.create_table(_INDEX, records)
+    stats.loading_time_sec = t.reset()
+    logging.info(f'Indexed {len(store.dcids)} docs into LanceDB')
+
+    stats.num_matches = _search_sync_lance(db, test)
+    stats.search_time_sec = t.reset()
+    stats.search_api_latency_sec = stats.search_time_sec / len(test.embeddings)
+
+    return stats
+
+
+#
+# Vertex AI
+#
+from google.cloud import aiplatform_v1
+
+# Set variables for the current deployed index.
+_API_ENDPOINT = "302175072.us-central1-496370955550.vdb.vertexai.goog"
+_INDEX_ENDPOINT = "projects/496370955550/locations/us-central1/indexEndpoints/8500794985312944128"
+_DEPLOYED_INDEX_ID = "dc_all_minilm_l6_v2_ft_1709655496660"
+
+
+def _vertex_search(client, test: Data):
+    ndone = 0
+    tot_results = 0
+    ncalls = 0
+    tot_latency = 0.0
+    while ndone < len(test.embeddings):
+        s, e = ndone, ndone + _BATCH_SZ
+        sl = test.embeddings[s:e]
+        queries = []
+        for emb in sl:
+            # Build FindNeighborsRequest object
+            queries.append(
+                aiplatform_v1.FindNeighborsRequest.Query(
+                    datapoint=aiplatform_v1.IndexDatapoint(feature_vector=emb),
+                    # The number of nearest neighbors to be retrieved
+                    neighbor_count=_TOPK))
+        request = aiplatform_v1.FindNeighborsRequest(
+            index_endpoint=_INDEX_ENDPOINT,
+            deployed_index_id=_DEPLOYED_INDEX_ID,
+            # Request can have multiple queries
+            queries=queries,
+            return_full_datapoint=False,
+        )
+        # Execute the request
+        t = Timeit()
+        response = client.find_neighbors(request)
+        tot_latency += t.reset()
+        ncalls += 1
+        for ns in response.nearest_neighbors:
+            tot_results += len(ns.neighbors)
+        ndone += len(sl)
+
+    logging.info(f'Vertex AI returned {tot_results}')
+    return tot_results, tot_latency / ncalls
+
+
+def run_vertex(_, test: Data) -> Stats:
+    stats = Stats(system='Vertex AI')
+
+    # Configure Vector Search client
+    t = Timeit()
+    vector_search_client = aiplatform_v1.MatchServiceClient(
+        client_options={"api_endpoint": _API_ENDPOINT})
+    stats.connection_time_sec = t.reset()
+
+    stats.num_matches, stats.search_api_latency_sec = _vertex_search(
+        vector_search_client, test)
+    stats.search_time_sec = t.reset()
+
+    return stats
 
 
 #
@@ -316,8 +427,13 @@ def main(_):
         'baseline': [run_baseline],
         'redis': [run_redis],
         'chroma': [run_chroma],
-        'lance': [run_lance],
-        'all': [run_baseline, run_redis, run_chroma, run_lance],
+        'lance_async': [run_async_lance],
+        'lance_sync': [run_sync_lance],
+        'vertex': [run_vertex],
+        'all': [
+            run_baseline, run_redis, run_chroma, run_async_lance,
+            run_sync_lance, run_vertex
+        ],
     }
     stats = []
     data = load_embeddings('store', FLAGS.store_embeddings)

@@ -3,6 +3,7 @@ asyncio
 chromadb
 datasets
 gcsfs
+google-cloud-aiplatform
 lancedb
 redis
 sentence_transformers
